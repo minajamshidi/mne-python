@@ -4,6 +4,7 @@
 
 import numpy as np
 
+from ..dipole import Dipole
 from ..fixes import rng_uniform
 from ..label import Label
 from ..source_estimate import SourceEstimate, VolSourceEstimate
@@ -18,6 +19,7 @@ from ..utils import (
     fill_doc,
     warn,
 )
+from .signals import NoiseGenerator
 
 
 @fill_doc
@@ -382,6 +384,7 @@ class SourceSimulator:
         self._duration = duration  # if not None, sets # samples
         self._last_samples = []
         self._chk_duration = 1000
+        self._waveform_ids = []
 
     @property
     def duration(self):
@@ -404,7 +407,25 @@ class SourceSimulator:
     def last_samp(self):
         return self.first_samp + self.n_times - 1
 
-    def add_data(self, label, waveform, events):
+    @property
+    def all_IDs(self):
+        return set(self._waveform_ids)
+
+    def number_of_sources(self, desired_ids=None):
+        """
+        Return the number of sources with ID in desired_ids.
+
+        :param desired_ids:
+        :return:
+        """
+        if desired_ids is None:
+            return len(self._labels)
+        else:
+            if not isinstance(desired_ids, list):
+                desired_ids = [desired_ids]
+            return sum(self._waveform_ids.count(id_) for id_ in desired_ids)
+
+    def add_data(self, label, waveform, events, waveform_id=None, allow_overlap=False):
         """Add data to the simulation.
 
         Data should be added in the form of a triplet of
@@ -423,6 +444,27 @@ class SourceSimulator:
             Events associated to the waveform(s) to specify when the activity
             should occur.
         """
+        if not isinstance(label, Label):
+            raise ValueError(f"label must be a Label, not {type(label)}")
+
+        label = label.restrict(self._src)
+        if len(label.vertices) == 0:
+            # todo: test this error
+            raise ValueError(
+                "The provided label does not include any vertex of the source space."
+            )
+
+        # Check if the vertices of the input label are included in any of self._labels
+        for lbl in self._labels:
+            mask_lbl = (
+                np.isin(label.vertices, lbl.vertices) if lbl.hemi == label.hemi else []
+            )
+            if np.any(mask_lbl) and not allow_overlap:
+                raise RuntimeError(
+                    "The input label has overlap with previously added labels. "
+                    "The source labels must be non-overlapping"
+                )
+
         _validate_type(label, Label, "label")
 
         # If it is not a list then make it one
@@ -439,10 +481,30 @@ class SourceSimulator:
                 "there should be a single waveform (%d != %d)."
                 % (len(waveform), len(events))
             )
+
+        if waveform_id is None:
+            waveform_id = ["unknown"] * len(waveform)
+        if isinstance(waveform_id, int):
+            waveform_id = str(waveform_id)
+
+        if isinstance(waveform_id, str):
+            waveform_id = [waveform_id] * len(waveform)
+        elif isinstance(waveform_id, list) and len(waveform_id) == 1:
+            waveform_id *= len(waveform)
+
+        if len(waveform) != len(
+            waveform_id
+        ):  # if no one-to-one mapping between IDs and waveforms
+            raise ValueError(
+                "For each waveform one ID should be passed to the function."
+            )
+        # waveform_id = [str(id1) for id1 in waveform_id]
+
         events = _ensure_events(events).astype(np.int64)
         # Update the last sample possible based on events + waveforms
         self._labels.extend([label] * len(events))
         self._waveforms.extend(waveform)
+        self._waveform_ids.extend(waveform_id)
         self._events = np.concatenate([self._events, events])
         assert self._events.dtype == np.int64
         # First sample per waveform is the first column of events
@@ -450,6 +512,27 @@ class SourceSimulator:
         self._last_samples = np.array(
             [self._events[i, 0] + len(w) - 1 for i, w in enumerate(self._waveforms)]
         )
+
+    def add_random_noise(self, n_noise=200, color="pink"):
+        """
+        Add random noise at the random vertices on the cortex.
+
+        :param n_noise:
+        :param color:
+        :return:
+        """
+        labels_noise = random_dipole_lbl(
+            self._labels, self._src, n_dipole=n_noise, subject=None
+        )
+        noise_generator = NoiseGenerator(color)
+
+        for lbl_noise in labels_noise:
+            self.add_data(
+                label=lbl_noise,
+                waveform=noise_generator.noise_signal(self.n_times),
+                events=np.zeros((1, 3), int),
+                waveform_id=f"{color} noise",
+            )
 
     def get_stim_channel(self, start_sample=0, stop_sample=None):
         """Get the stim channel from the provided data.
@@ -588,3 +671,297 @@ class SourceSimulator:
                 self.get_stc(start_sample, stop_sample),
                 self.get_stim_channel(start_sample, stop_sample),
             )
+
+    def restrict_sources(self, desired_ids, return_indices=False):
+        """
+        Return a subset of the sources defined by the desired source.
+
+        :param desired_ids:
+        :param return_indices:
+        :return:
+        """
+        if isinstance(desired_ids, str):
+            desired_ids = [desired_ids]
+        elif not isinstance(desired_ids, list):
+            raise ValueError("The desired IDs should be a (list of) string(s). ")
+
+        mask_restrict = np.isin(self._waveform_ids, desired_ids)
+        desired_indices = np.where(mask_restrict)[0]
+        if not np.any(mask_restrict):
+            return None
+        simulator_new = SourceSimulator(
+            self._src, self._tstep, self._duration, self.first_samp
+        )
+        simulator_new._labels = [
+            lbl for i, lbl in enumerate(self._labels) if i in desired_indices
+        ]
+        simulator_new._waveforms = [
+            wave for i, wave in enumerate(self._waveforms) if i in desired_indices
+        ]
+        simulator_new._events = self._events[desired_indices]
+        simulator_new._last_samples = self._last_samples[desired_indices]
+        simulator_new._chk_duration = self._chk_duration
+        simulator_new._waveform_ids = [
+            wv_id for i, wv_id in enumerate(self._waveform_ids) if i in desired_indices
+        ]
+        return (simulator_new, desired_indices) if return_indices else simulator_new
+
+    def calculate_snr(
+        self,
+        signal_id,
+        info,
+        fwd,
+        freq_band,
+        noise_ids="pink noise",
+        iir_params=None,
+    ):
+        """
+        Calculate the SNR of the given source IDs.
+
+        :param signal_id:
+        :param info:
+        :param fwd:
+        :param noise_ids:
+        :param freq_band:
+        :param iir_params:
+        :return:
+        """
+        from .raw import simulate_raw
+
+        if not isinstance(
+            signal_id, str
+        ):  # the function only calculates the SNR of one type of source
+            raise ValueError("the waveform ID should be a string.")
+        if signal_id not in set(self._waveform_ids):
+            raise ValueError(
+                f"The provided signal ID {signal_id} does not exist. "
+                f"Use the summary method to get an idea of the available IDs."
+            )
+        # todo: check that the noise IDs. Also the noise term should be in the ID
+
+        simulator_signal, ind_signals = self.restrict_sources(
+            signal_id, return_indices=True
+        )
+        simulator_noise = self.restrict_sources(noise_ids)
+
+        raw_signal = simulate_raw(info, simulator_signal, forward=fwd)
+        raw_noise = simulate_raw(info, simulator_noise, forward=fwd)
+        if freq_band is not None:
+            iir_params = (
+                dict(order=2, ftype="butter") if iir_params is None else iir_params
+            )
+            raw_signal.filter(
+                l_freq=freq_band[0],
+                h_freq=freq_band[1],
+                method="iir",
+                iir_params=iir_params,
+            )
+            raw_noise.filter(
+                l_freq=freq_band[0],
+                h_freq=freq_band[1],
+                method="iir",
+                iir_params=iir_params,
+            )
+
+        power_signal = np.sum(np.var(raw_signal.get_data(), axis=-1))
+        power_noise = np.sum(np.var(raw_noise.get_data(), axis=-1))
+        snr_current = power_signal / power_noise
+        # todo: do we need to return ind_signals?
+        return snr_current, ind_signals
+
+    def adjust_snr(
+        self,
+        signal_id,
+        desired_snr,
+        info,
+        fwd,
+        freq_band,
+        noise_ids="pink noise",
+        iir_params=None,
+    ):
+        """
+        Adjust the SNR of desired sources at the given frequency band.
+
+        :param signal_id:
+        :param desired_snr:
+        :param info:
+        :param fwd:
+        :param freq_band:
+        :param noise_ids:
+        :param iir_params:
+        :return:
+        """
+        snr_before, ind_signals = self.calculate_snr(
+            signal_id, info, fwd, noise_ids, freq_band, iir_params
+        )
+        correction_factor = np.sqrt(desired_snr / snr_before)
+        self.rescale_sources(correction_factor, ind_signals)
+        snr_after, _ = self.calculate_snr(
+            signal_id, info, fwd, noise_ids, freq_band, iir_params
+        )
+        print(
+            f"SNR before adjustment was {snr_before}, ",
+            "after adjustment it is {snr_after}",
+        )
+
+    def rescale_sources(self, factor, ind_signals=None):
+        """
+        Rescale the source signals with the given factor.
+
+        :param factor:
+        :param ind_signals:
+        :return:
+        """
+        if ind_signals is None:
+            ind_signals = range(len(self._waveforms))
+        for i_sig in ind_signals:
+            self._waveforms[i_sig] = self._waveforms[i_sig] * factor
+
+    def summary(self, verbose=True):
+        """
+        Give a summary of the sources in the class.
+
+        :param verbose:
+        :return:
+        """
+        from collections import defaultdict
+
+        result = defaultdict(int)
+        for id1 in set(self._waveform_ids):
+            result[id1] += self.number_of_sources(id1)
+        if verbose:
+            for sig_id, n_sig in result.items():
+                print(
+                    f"The source simulator includes {n_sig} source(s)",
+                    ' with ID "{sig_id}".',
+                )
+        return result
+
+    def plot_dipole_locations(
+        self,
+        trans_fname,
+        subject,
+        subjects_dir,
+        desired_ids="all",
+        noise_scale=2e-3,
+        source_scale=7e-3,
+        noise_color=(0, 0, 255),
+        source_color=(255, 0, 0),
+    ):
+        """
+        Plot dipole locations of the sources.
+
+        :param trans_fname:
+        :param subject:
+        :param subjects_dir:
+        :param desired_ids:
+        :param noise_scale:
+        :param source_scale:
+        :param noise_color:
+        :param source_color:
+        :return:
+        """
+        from ..transforms import read_trans
+        from ..viz import create_3d_figure, plot_alignment, plot_dipole_locations
+
+        desired_ids = set(self._waveform_ids) if desired_ids == "all" else desired_ids
+
+        trans = read_trans(trans_fname)
+
+        fig = create_3d_figure(size=(600, 400), bgcolor=(1.0, 1.0, 1.0))
+        plot_alignment(
+            subject=subject,
+            subjects_dir=subjects_dir,
+            trans=trans,
+            surfaces="white",
+            coord_frame="mri",
+            fig=fig,
+        )
+
+        lbl_hemi = {"lh": 0, "rh": 1}
+        for id1 in desired_ids:
+            _, ind_id1 = self.restrict_sources(desired_ids=id1, return_indices=True)
+            dip_pos = np.concatenate(
+                tuple(
+                    [
+                        self._src[lbl_hemi[self._labels[i].hemi]]["rr"][
+                            self._labels[i].vertices
+                        ]
+                        for i in ind_id1
+                    ]
+                ),
+                axis=0,
+            )
+            dip_ori = np.zeros_like(dip_pos)  # misc orientation
+
+            dip_len = len(dip_pos)
+            dip_times = [0]
+
+            actual_amp = np.ones(dip_len)  # misc amp
+            actual_gof = np.ones(dip_len)  # misc GOF
+            dipoles = Dipole(dip_times, dip_pos, actual_amp, dip_ori, actual_gof)
+
+            scale = noise_scale if "noise" in id1 else source_scale
+            color = noise_color if "noise" in id1 else source_color
+
+            plot_dipole_locations(
+                dipoles=dipoles,
+                trans=trans,
+                mode="sphere",
+                subject=subject,
+                subjects_dir=subjects_dir,
+                coord_frame="mri",
+                scale=scale,
+                fig=fig,
+                color=color,
+            )
+        return fig
+
+
+def random_dipole_lbl(exclude_labels, src, n_dipole=200, subject=None):
+    """
+    Generate labels of randomly selected dipoles.
+
+    :param source_labels:
+    :return:
+    """
+    if subject is None:
+        if exclude_labels:
+            subject = exclude_labels[0].subject
+        else:
+            subject = "sample"
+
+    # extract the vertices of exclude_labels and exclude them
+    # from the vertices of the src
+    src_vertno = [src[0]["vertno"], src[1]["vertno"]]
+    for lbl in exclude_labels:
+        this_hemi = 0 if (lbl.hemi == "lh") else 1
+        _, idx_del_src, _ = np.intersect1d(
+            src_vertno[this_hemi], lbl.vertices, return_indices=True
+        )
+        src_vertno[this_hemi] = np.delete(src_vertno[this_hemi], idx_del_src)
+
+    # select random vertices from the remaining vertices
+    n_vert_lh, n_vert_rh = len(src_vertno[0]), len(src_vertno[1])
+    ind_dipole = np.random.choice(
+        np.arange(n_vert_lh + n_vert_rh), size=n_dipole, replace=False
+    )
+    ind_lh = ind_dipole[ind_dipole < n_vert_lh]
+    ind_rh = ind_dipole[ind_dipole >= n_vert_lh] - n_vert_lh
+    dipole_vertno = [sorted(src_vertno[0][ind_lh]), sorted(src_vertno[1][ind_rh])]
+
+    # convert the vertices to labels in the following
+    dipole_labels = []
+    for hemi, vertices in enumerate(dipole_vertno):
+        this_hemi = "lh" if hemi == 0 else "rh"
+        for vert in vertices:
+            lbl = Label(
+                [vert],
+                src[hemi]["rr"][vert][None, :] * 1e3,
+                None,
+                this_hemi,
+                "Label from vertex",
+                subject=subject,
+            )
+            dipole_labels.append(lbl)
+    return dipole_labels
